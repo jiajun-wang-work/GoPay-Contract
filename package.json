@@ -1,0 +1,21 @@
+{
+  "name": "@gopay/contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GoPay multi-asset private swap contract for Midnight (Compact)",
+  "scripts": {
+    "compact": "compact compile --skip-zk src/gopay.compact src/managed/gopay",
+    "compact:zk": "compact compile src/gopay.compact src/managed/gopay",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
