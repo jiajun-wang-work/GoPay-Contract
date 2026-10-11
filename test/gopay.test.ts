@@ -4,7 +4,6 @@ import {
   ecMulGenerator,
   encodeRawTokenType,
   encodeUserAddress,
-  jubjubSampleScalar,
   sampleRawTokenType,
   sampleUserAddress,
 } from '@midnight-ntwrk/compact-runtime';
@@ -21,6 +20,8 @@ import { createPrivateState, type GoPayPrivateState } from '../src/witnesses.js'
 import { computeFee, decryptFeeReceipt, splitInput } from '../src/fees.js';
 import { GoPaySimulator } from './simulator.js';
 
+// Test scalars use 248 random bits, within the ledger 8 Field/scalar range.
+const jubjubSampleScalar = (): bigint => BigInt('0x' + randomBytes(31).toString('hex')) || 1n;
 const rand = (): Uint8Array => new Uint8Array(randomBytes(32));
 const text32 = (s: string): Uint8Array => {
   const out = new Uint8Array(32);
@@ -144,6 +145,165 @@ describe('GoPay contract', () => {
   });
 
   // ───────────────────────── Registry & governance ─────────────────────────
+
+  describe('AMM full-range LP positions', () => {
+    const seed = async () => {
+      await sim.call(alice, 'createPool', usdc, jpyc);
+      const id = pureCircuits.poolIdOf(usdc, jpyc);
+      const a = await deposit(usdc, 10000n, alice);
+      const b = await deposit(jpyc, 40000n, alice);
+      const lp = note(pureCircuits.lpAssetOf(id), 20000n, alice);
+      await sim.call(alice, 'addLiquidity', id, a, sim.notePath(a), b, sim.notePath(b),
+        10000n, 40000n, lp.amount, lp.amount, rand(), rand(), lp.nonce, BigInt(sim.time + 60));
+      expect(sim.hasNote(lp)).toBe(true);
+      return { id, lp };
+    };
+    it('adds proportional liquidity, swaps both ways and exits during pause', async () => {
+      const { id, lp } = await seed();
+      const a = await deposit(usdc, 1000n, bob);
+      const b = await deposit(jpyc, 4000n, bob);
+      const bobLp = note(lp.assetId, 2000n, bob);
+      await sim.call(bob, 'addLiquidity', id, a, sim.notePath(a), b, sim.notePath(b),
+        1000n, 4000n, 2000n, 2000n, rand(), rand(), bobLp.nonce, BigInt(sim.time + 60));
+      for (const forward of [true, false]) {
+        const p = sim.ledger().pools.lookup(id);
+        const input = await deposit(forward ? usdc : jpyc, 100n, bob);
+        const x = forward ? p.reserveA : p.reserveB;
+        const y = forward ? p.reserveB : p.reserveA;
+        const out = 100n * 9970n * y / (x * 10000n + 100n * 9970n);
+        const output = note(forward ? jpyc : usdc, out, bob);
+        await sim.call(bob, 'swapExactIn', id, forward, input, sim.notePath(input),
+          100n, out, out, rand(), output.nonce, BigInt(sim.time + 60));
+        expect(sim.hasNote(output)).toBe(true);
+        const next = sim.ledger().pools.lookup(id);
+        expect(next.reserveA * next.reserveB).toBeGreaterThanOrEqual(p.reserveA * p.reserveB);
+      }
+      await sim.call(admin, 'setPaused', { deposit: true, transfer: true, swap: true, withdraw: true });
+      const p = sim.ledger().pools.lookup(id);
+      const outA = note(usdc, lp.amount * p.reserveA / p.shares, alice);
+      const outB = note(jpyc, lp.amount * p.reserveB / p.shares, alice);
+      await sim.call(alice, 'removeLiquidity', id, lp, sim.notePath(lp), lp.amount,
+        outA.amount, outB.amount, outA.amount, outB.amount, rand(), outA.nonce, outB.nonce,
+        BigInt(sim.time + 60));
+      expect(sim.hasNote(outA)).toBe(true);
+      expect(sim.hasNote(outB)).toBe(true);
+      expect(sim.ledger().pools.lookup(id).shares).toBe(2000n);
+    });
+    it('rejects LP theft, repeated burns and incorrect proportional deposits', async () => {
+      const { id, lp } = await seed();
+      const remove = (caller: GoPayPrivateState) => sim.call(caller, 'removeLiquidity', id,
+        lp, sim.notePath(lp), 20000n, 10000n, 40000n, 0n, 0n,
+        rand(), rand(), rand(), BigInt(sim.time + 60));
+      await expect(remove(mallory)).rejects.toThrow('not note owner');
+      const a = await deposit(usdc, 1000n, bob);
+      const b = await deposit(jpyc, 4001n, bob);
+      const add = (amountB: bigint, minted: bigint) => sim.call(bob, 'addLiquidity', id,
+        a, sim.notePath(a), b, sim.notePath(b), 1000n, amountB, minted, 0n,
+        rand(), rand(), rand(), BigInt(sim.time + 60));
+      await expect(add(4001n, 2000n)).rejects.toThrow('ratio mismatch');
+      await expect(add(4000n, 2001n)).rejects.toThrow('quotient');
+      await remove(alice);
+      // Reseed so the second burn reaches Note validation with nonzero reserves.
+      const nextA = await deposit(usdc, 10000n, bob);
+      const nextB = await deposit(jpyc, 40000n, bob);
+      await sim.call(bob, 'addLiquidity', id, nextA, sim.notePath(nextA), nextB,
+        sim.notePath(nextB), 10000n, 40000n, 20000n, 0n,
+        rand(), rand(), rand(), BigInt(sim.time + 60));
+      await expect(remove(alice)).rejects.toThrow('already spent');
+    });
+    it('rejects reverse duplicate pools, forged output, slippage and expired requests', async () => {
+      const { id } = await seed();
+      await expect(sim.call(bob, 'createPool', jpyc, usdc)).rejects.toThrow('pool exists');
+      const input = await deposit(usdc, 100n, bob);
+      const out = 100n * 9970n * 40000n / (10000n * 10000n + 100n * 9970n);
+      const swap = (amountOut: bigint, minimum: bigint, deadline = BigInt(sim.time + 60)) =>
+        sim.call(bob, 'swapExactIn', id, true, input, sim.notePath(input), 100n,
+          amountOut, minimum, rand(), rand(), deadline);
+      await expect(swap(out + 1n, 0n)).rejects.toThrow('quotient');
+      await expect(swap(out, out + 1n)).rejects.toThrow('slippage');
+      await expect(swap(out, 0n, BigInt(sim.time - 1))).rejects.toThrow('expired');
+      await sim.call(admin, 'setAssetOperations', usdc, true, false, true, CAP);
+      await expect(swap(out, 0n)).rejects.toThrow('not tradable');
+    });
+    it('rejects incorrect initial shares and allows full withdrawal then reseeding', async () => {
+      const { id, lp } = await seed();
+      await sim.call(alice, 'removeLiquidity', id, lp, sim.notePath(lp), 20000n,
+        10000n, 40000n, 0n, 0n, rand(), rand(), rand(), BigInt(sim.time + 60));
+      expect(sim.ledger().pools.lookup(id).shares).toBe(0n);
+      const a = await deposit(usdc, 9n, bob);
+      const b = await deposit(jpyc, 16n, bob);
+      const add = (m: bigint) => sim.call(bob, 'addLiquidity', id, a, sim.notePath(a),
+        b, sim.notePath(b), 9n, 16n, m, 0n, rand(), rand(), rand(), BigInt(sim.time + 60));
+      await expect(add(13n)).rejects.toThrow('initial shares');
+      await add(12n);
+      expect(sim.ledger().pools.lookup(id).shares).toBe(12n);
+    });
+  });
+
+  describe('Note checkout payments', () => {
+    const checkout = async () => {
+      const id = await sim.call(bob, 'createPayment', usdc, 100n, BigInt(sim.time + 60), rand());
+      const input = await deposit(usdc, 150n, alice);
+      const merchant = note(usdc, 100n, bob);
+      const change = note(usdc, 50n, alice);
+      const refundNonce = rand();
+      const pay = () => sim.call(alice, 'payPayment', id, input, sim.notePath(input),
+        merchant.nonce, change.nonce, refundNonce);
+      return { id, input, merchant, change, refundNonce, pay };
+    };
+    it('pays once and supports cumulative partial then full refunds during pause', async () => {
+      const c = await checkout();
+      expect(await c.pay()).toEqual(sim.noteCommitment(c.merchant));
+      expect(sim.hasNote(c.change)).toBe(true);
+      await expect(c.pay()).rejects.toThrow('not open');
+      await expect(sim.call(bob, 'cancelPayment', c.id)).rejects.toThrow('not open');
+      await sim.call(admin, 'setPaused', { deposit: true, transfer: true, swap: true, withdraw: true });
+      const remaining = note(usdc, 60n, bob);
+      const refund = note(usdc, 40n, alice);
+      await sim.call(bob, 'refundPayment', c.id, c.merchant, sim.notePath(c.merchant),
+        40n, pk(alice), c.refundNonce, refund.nonce, remaining.nonce);
+      expect(sim.hasNote(refund)).toBe(true);
+      expect(sim.ledger().payments.lookup(c.id).refundedAmount).toBe(40n);
+      await expect(sim.call(bob, 'refundPayment', c.id, remaining, sim.notePath(remaining),
+        61n, pk(alice), c.refundNonce, rand(), rand())).rejects.toThrow('refund amount');
+      await sim.call(bob, 'refundPayment', c.id, remaining, sim.notePath(remaining),
+        60n, pk(alice), c.refundNonce, rand(), rand());
+      expect(sim.ledger().payments.lookup(c.id).refundedAmount).toBe(100n);
+      await expect(sim.call(bob, 'refundPayment', c.id, remaining, sim.notePath(remaining),
+        1n, pk(alice), c.refundNonce, rand(), rand())).rejects.toThrow('not refundable');
+    });
+    it('rejects refund theft and non-merchant authorization', async () => {
+      const c = await checkout();
+      await c.pay();
+      await expect(sim.call(bob, 'refundPayment', c.id, c.merchant, sim.notePath(c.merchant),
+        10n, pk(mallory), c.refundNonce, rand(), rand())).rejects.toThrow('refund recipient');
+      await expect(sim.call(mallory, 'refundPayment', c.id, c.merchant, sim.notePath(c.merchant),
+        10n, pk(alice), c.refundNonce, rand(), rand())).rejects.toThrow('not merchant');
+    });
+    it('enforces expiry, merchant cancellation, pause and exact asset', async () => {
+      const c = await checkout();
+      await expect(sim.call(mallory, 'cancelPayment', c.id)).rejects.toThrow('not merchant');
+      const wrong = await deposit(jpyc, 150n, alice);
+      await expect(sim.call(alice, 'payPayment', c.id, wrong, sim.notePath(wrong),
+        rand(), rand(), rand())).rejects.toThrow('payment input');
+      sim.time += 60;
+      await expect(c.pay()).rejects.toThrow('expired');
+      await sim.call(bob, 'cancelPayment', c.id);
+      await expect(c.pay()).rejects.toThrow('not open');
+    });
+    it('rejects duplicate IDs, zero amounts and paused payment', async () => {
+      const nonce = rand();
+      await sim.call(bob, 'createPayment', usdc, 100n, BigInt(sim.time + 60), nonce);
+      await expect(sim.call(bob, 'createPayment', usdc, 100n, BigInt(sim.time + 60), nonce))
+        .rejects.toThrow('payment exists');
+      await expect(sim.call(bob, 'createPayment', usdc, 0n, BigInt(sim.time + 60), rand()))
+        .rejects.toThrow('zero payment');
+      const c = await checkout();
+      await sim.call(admin, 'setPaused', { deposit: false, transfer: true, swap: false, withdraw: false });
+      await expect(c.pay()).rejects.toThrow('paused');
+      await sim.call(bob, 'cancelPayment', c.id);
+    });
+  });
 
   describe('registry & governance', () => {
     it('derives assetId from source identity and registers assets disabled by default', async () => {
@@ -469,7 +629,13 @@ describe('GoPay contract', () => {
 
     it('rejects orders bound to a stale treasury config version', async () => {
       const inventory = await deposit(jpyc, 1_000_000n, maker);
-      const { order } = await placeOrder(makeOrder(10_000n, 1_500n, { treasuryConfigVersion: 99n }));
+      await expect(placeOrder(makeOrder(10_000n, 1_500n, { treasuryConfigVersion: 99n })))
+        .rejects.toThrow(/stale treasury config/);
+      const { order } = await placeOrder(makeOrder(10_000n, 1_500n, { expiry: BigInt(sim.time + 10000) }));
+      const effectiveAt = BigInt(sim.time) + DELAY;
+      await sim.call(admin, 'scheduleTreasuryRotation', pk(treasury), ecMulGenerator(treasuryViewSecret), effectiveAt);
+      sim.time = Number(effectiveAt);
+      await sim.call(admin, 'applyPendingUpdate');
       await expect(fill(order, inventory)).rejects.toThrow(/stale treasury config/);
     });
 

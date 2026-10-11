@@ -1,0 +1,12 @@
+import l0 from '../../GoPay-Webapp/src/lib/i18n/en.json';
+import l1 from '../../GoPay-Webapp/src/lib/i18n/zh-CN.json';
+import l2 from '../../GoPay-Webapp/src/lib/i18n/zh-TW.json';
+import l3 from '../../GoPay-Webapp/src/lib/i18n/ja.json';
+import l4 from '../../GoPay-Webapp/src/lib/i18n/ko.json';
+import l5 from '../../GoPay-Webapp/src/lib/i18n/es.json';
+import l6 from '../../GoPay-Webapp/src/lib/i18n/de.json';
+import l7 from '../../GoPay-Webapp/src/lib/i18n/fr.json';
+import l8 from '../../GoPay-Webapp/src/lib/i18n/ru.json';
+import l9 from '../../GoPay-Webapp/src/lib/i18n/it.json';
+import l10 from '../../GoPay-Webapp/src/lib/i18n/pt.json';
+export default { 'en': l0, 'zh-CN': l1, 'zh-TW': l2, 'ja': l3, 'ko': l4, 'es': l5, 'de': l6, 'fr': l7, 'ru': l8, 'it': l9, 'pt': l10 };

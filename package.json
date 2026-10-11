@@ -5,16 +5,32 @@
   "type": "module",
   "description": "GoPay multi-asset private swap contract for Midnight (Compact)",
   "scripts": {
-    "compact": "compact compile --skip-zk src/gopay.compact src/managed/gopay",
-    "compact:zk": "compact compile src/gopay.compact src/managed/gopay",
+    "compact": "compact compile +0.31.1 --skip-zk src/gopay.compact src/managed/gopay",
+    "compact:zk": "compact compile +0.31.1 src/gopay.compact src/managed/gopay",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "deploy:preprod": "node scripts/preprod-server.mjs",
+    "check:deploy": "node scripts/check-deploy.mjs",
+    "typecheck:deploy": "tsc -p deploy-ui/tsconfig.json"
   },
   "dependencies": {
-    "@midnight-ntwrk/compact-runtime": "0.19.0"
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
+    "@midnight-ntwrk/midnight-js-contracts": "4.1.1",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-network-id": "4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-types": "4.1.1",
+    "@midnight-ntwrk/wallet-sdk-address-format": "3.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.2.3",
+    "esbuild": "0.27.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
     "typescript": "^5.9.0",
     "vitest": "^4.0.0"
   }

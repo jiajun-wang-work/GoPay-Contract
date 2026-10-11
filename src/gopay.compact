@@ -1,34 +1,34 @@
-// GoPay — Midnight 多资产隐私兑换核心合约
+// GoPay — Midnight 多资产隐私兑换核心合约 / GoPay — Midnight multi-asset private swap core contract
 //
-// 对应 README.CN.md v0.5。本合约实现“内部 Note 凭证”路线（README 4.1 / 5）：
-// Vault 内部记账、RFQ 兑换结算与平台金库费用入账放在同一核心合约中。
+// 对应 README.CN.md v0.5。本合约实现“内部 Note 凭证”路线（README 4.1 / 5）： / Implements the internal Note model from README.CN.md v0.5 (sections 4.1 / 5):
+// Vault 内部记账、RFQ 兑换结算与平台金库费用入账放在同一核心合约中。 / Vault accounting, RFQ settlement and platform treasury fees share one core contract.
 //
-//   - AssetRegistry / AdapterRegistry：资产身份、适配器、额度与操作开关
-//   - GoPayVault：unshielded 储备存取、适配器入账铸造与跨链赎回请求
-//   - Private notes：私密转账 / 合并（承诺 + nullifier）
-//   - PrivateSwap：RFQ 两阶段整单结算（createOrder → fillOrder / cancelOrder）
-//   - PlatformTreasury：固定 50 bps 手续费，加密收据由金库查看密钥解密
-//   - Governance：管理员承诺、分操作暂停、延迟生效的密钥轮换
+//   - AssetRegistry / AdapterRegistry：资产身份、适配器、额度与操作开关 / - AssetRegistry / AdapterRegistry: asset identities, adapters, caps and operation switches
+//   - GoPayVault：unshielded 储备存取、适配器入账铸造与跨链赎回请求 / - GoPayVault: unshielded reserve deposits/withdrawals, adapter minting and cross-chain redemption requests
+//   - Private notes：私密转账 / 合并（承诺 + nullifier） / - Private notes: private transfers / merges (commitments + nullifiers)
+//   - PrivateSwap：RFQ 两阶段整单结算（createOrder → fillOrder / cancelOrder） / - PrivateSwap: two-stage full-order RFQ settlement (createOrder → fillOrder / cancelOrder)
+//   - PlatformTreasury：固定 50 bps 手续费，加密收据由金库查看密钥解密 / - PlatformTreasury: fixed 50 bps fee; encrypted receipts are decrypted with the treasury viewing key
+//   - Governance：管理员承诺、分操作暂停、延迟生效的密钥轮换 / - Governance: admin commitment, per-operation pauses and delayed key rotation
 //
-// 状态：原型实现，未经安全审计，不可用于真实资产。
+// 状态：原型实现，未经安全审计，不可用于真实资产。 / Status: unaudited prototype; do not use with real assets.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 类型
+// 类型 / Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 结算表示（README 3.2 settlementRepresentation）
+// 结算表示（README 3.2 settlementRepresentation） / Settlement representation (README 3.2 settlementRepresentation)
 export enum Representation {
-  // 由本合约持有的 Midnight unshielded 代币 1:1 支撑（例如测试资产、NIGHT 储备凭证）
+  // 由本合约持有的 Midnight unshielded 代币 1:1 支撑（例如测试资产、NIGHT 储备凭证） / Backed 1:1 by Midnight unshielded tokens held by this contract (e.g. test assets or NIGHT reserve notes)
   unshieldedReserve,
-  // 由已批准的桥 / 托管适配器验证外部入账后铸造，并通过赎回请求兑付
+  // 由已批准的桥 / 托管适配器验证外部入账后铸造，并通过赎回请求兑付 / Minted after an approved bridge/custody adapter verifies an external deposit; paid out through redemption requests
   bridgeAdapter
 }
 
-// assetId = persistentHash(domain, sourceChain, sourceToken, issuerOrBridge, assetVersion)
+// 资产 ID 派生 / Asset ID derivation: assetId = persistentHash(domain, sourceChain, sourceToken, issuerOrBridge, assetVersion)
 export struct AssetIdentity {
   sourceChain: Bytes<32>;
   sourceToken: Bytes<32>;
@@ -39,52 +39,52 @@ export struct AssetIdentity {
 export struct AssetConfig {
   identity: AssetIdentity;
   representation: Representation;
-  adapterId: Bytes<32>;       // bridgeAdapter 时必填；unshieldedReserve 时为 0
-  reserveColor: Bytes<32>;    // unshieldedReserve 时的储备代币类型；bridgeAdapter 时为 0
+  adapterId: Bytes<32>;       // bridgeAdapter 时必填；unshieldedReserve 时为 0 / Required for bridgeAdapter; zero for unshieldedReserve
+  reserveColor: Bytes<32>;    // unshieldedReserve 时的储备代币类型；bridgeAdapter 时为 0 / Reserve token type for unshieldedReserve; zero for bridgeAdapter
   decimals: Uint<8>;
-  depositCap: Uint<128>;      // 未兑付总量上限（最小单位）
+  depositCap: Uint<128>;      // 未兑付总量上限（最小单位） / Outstanding supply cap in smallest asset units
   depositEnabled: Boolean;
   swapEnabled: Boolean;
   withdrawEnabled: Boolean;
-  swapSlot: Uint<64>;         // 在 swapAssets 树中的固定槽位
+  swapSlot: Uint<64>;         // 在 swapAssets 树中的固定槽位 / Fixed slot in the swapAssets tree
   configVersion: Uint<32>;
 }
 
 export struct AdapterConfig {
-  authCommitment: Bytes<32>;  // persistentHash(domain, adapterSecret)
+  authCommitment: Bytes<32>;  // 适配器认证承诺 / Adapter authentication commitment: persistentHash(domain, adapterSecret)
   adapterVersion: Uint<32>;
   enabled: Boolean;
 }
 
-// 私密余额凭证。链上只保存其承诺。
+// 私密余额凭证。链上只保存其承诺。 / Private balance note; only its commitment is stored on-chain.
 export struct Note {
   assetId: Bytes<32>;
   amount: Uint<128>;
-  ownerPk: Bytes<32>;         // persistentHash(domain, ownerSecret)
-  nonce: Bytes<32>;           // 唯一随机数，同时作为承诺盲化因子
+  ownerPk: Bytes<32>;         // 所有者公钥派生 / Owner public key derivation: persistentHash(domain, ownerSecret)
+  nonce: Bytes<32>;           // 唯一随机数，同时作为承诺盲化因子 / Unique nonce, also used to blind the commitment
 }
 
-// 用户订单（RFQ 报价被用户接受后形成）。链上只保存其承诺。
+// 用户订单（RFQ 报价被用户接受后形成）。链上只保存其承诺。 / User order created after accepting an RFQ quote; only its commitment is stored on-chain.
 export struct Order {
-  ownerPk: Bytes<32>;             // 付款方，撤单与退款权限
-  makerPk: Bytes<32>;             // 报价做市商，唯一可成交方
-  recipientPk: Bytes<32>;         // 兑换输出的收款人（可为自己）
+  ownerPk: Bytes<32>;             // 付款方，撤单与退款权限 / Payer with cancellation and refund rights
+  makerPk: Bytes<32>;             // 报价做市商，唯一可成交方 / Quoted maker, the only party allowed to fill the order
+  recipientPk: Bytes<32>;         // 兑换输出的收款人（可为自己） / Swap output recipient, possibly the payer
   inputAssetId: Bytes<32>;
-  inputAmount: Uint<128>;         // 用户确认的输入总额（含平台费，不含找零）
+  inputAmount: Uint<128>;         // 用户确认的输入总额（含平台费，不含找零） / User-confirmed total input, including platform fee and excluding change
   outputAssetId: Bytes<32>;
-  netOutputAmount: Uint<128>;     // 用户最终净到账数量
-  recipientNonce: Bytes<32>;      // 输出 Note 的随机数，由用户预先选定
-  expiry: Uint<64>;               // 区块时间（秒），成交时公开比较
-  quoteId: Bytes<32>;             // 做市商报价承诺（含 quoteNonce）
+  netOutputAmount: Uint<128>;     // 用户最终净到账数量 / Final net amount received by the recipient
+  recipientNonce: Bytes<32>;      // 输出 Note 的随机数，由用户预先选定 / Output Note nonce selected in advance by the user
+  expiry: Uint<64>;               // 区块时间（秒），成交时公开比较 / Block time in seconds, publicly checked at fill time
+  quoteId: Bytes<32>;             // 做市商报价承诺（含 quoteNonce） / Maker quote commitment, including quoteNonce
   treasuryConfigVersion: Uint<32>;
   orderNonce: Bytes<32>;
 }
 
-// 适配器输出的已验证入账信息（README 4.4）
+// 适配器输出的已验证入账信息（README 4.4） / Verified deposit evidence supplied by the adapter (README 4.4)
 export struct DepositEvidence {
   sourceChain: Bytes<32>;
   sourceToken: Bytes<32>;
-  uniqueDepositId: Bytes<32>;     // 需覆盖来源交易与事件位置
+  uniqueDepositId: Bytes<32>;     // 需覆盖来源交易与事件位置 / Must cover the source transaction and event position
   actualReceivedAmount: Uint<128>;
   destinationContract: Bytes<32>;
   destinationAssetId: Bytes<32>;
@@ -98,13 +98,13 @@ export struct RedemptionRecord {
   assetId: Bytes<32>;
   amount: Uint<128>;
   adapterId: Bytes<32>;
-  destinationCommitment: Bytes<32>;  // 目标链 + 地址的哈希，明文链下交给适配器
-  refundCommitment: Bytes<32>;       // 适配器确认外链未兑付时恢复的 Note 承诺
-  payoutReference: Bytes<32>;        // 外链兑付交易引用
+  destinationCommitment: Bytes<32>;  // 目标链 + 地址的哈希，明文链下交给适配器 / Hash of destination chain and address; plaintext is delivered to the adapter off-chain
+  refundCommitment: Bytes<32>;       // 适配器确认外链未兑付时恢复的 Note 承诺 / Note commitment restored when the adapter confirms no external payout
+  payoutReference: Bytes<32>;        // 外链兑付交易引用 / External-chain payout transaction reference
   status: RedemptionStatus;
 }
 
-// 手续费加密收据：金库以查看私钥 tsk 计算 S = tsk·R，解密费用数量并恢复 Note。
+// 手续费加密收据：金库以查看私钥 tsk 计算 S = tsk·R，解密费用数量并恢复 Note。 / Encrypted fee receipt: the treasury computes S = tsk·R with its viewing secret to decrypt the fee amount and recover the Note.
 export struct FeeReceipt {
   orderNullifier: Bytes<32>;
   ephemeralKey: JubjubPoint;
@@ -132,48 +132,48 @@ export struct PendingUpdate {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 公开状态（README 5.2）
+// 公开状态（README 5.2） / Public state (README 5.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Governance
+// Governance / 治理
 export sealed ledger governanceDelay: Uint<64>;
 export ledger adminCommitment: Bytes<32>;
 export ledger paused: PauseFlags;
 export ledger pendingUpdate: PendingUpdate;
 
-// Registries
+// Registries / 注册表
 export ledger adapters: Map<Bytes<32>, AdapterConfig>;
 export ledger assets: Map<Bytes<32>, AssetConfig>;
 export ledger assetSupply: Map<Bytes<32>, Uint<128>>;
-export ledger swapAssets: MerkleTree<8, Bytes<32>>;   // 可交易资产集合，用于隐藏币种的成员证明
+export ledger swapAssets: MerkleTree<8, Bytes<32>>;   // 可交易资产集合，用于隐藏币种的成员证明 / Tradable asset set for membership proofs that hide the asset identity
 export ledger nextSwapSlot: Uint<64>;
 
-// Private notes & orders
+// Private notes & orders / 私密凭证与订单
 export ledger noteCommitments: HistoricMerkleTree<32, Bytes<32>>;
 export ledger spentNullifiers: Set<Bytes<32>>;
 export ledger orderCommitments: HistoricMerkleTree<32, Bytes<32>>;
 export ledger orderNullifiers: Set<Bytes<32>>;
 
-// Vault
+// Vault / 金库
 export ledger usedDeposits: Set<Bytes<32>>;
 export ledger redemptions: Map<Bytes<32>, RedemptionRecord>;
 
-// Platform treasury
+// Platform treasury / 平台金库
 export ledger treasuryOwnerPk: Bytes<32>;
 export ledger treasuryViewKey: JubjubPoint;
 export ledger treasuryConfigVersion: Uint<32>;
 export ledger feeReceipts: Map<Bytes<32>, FeeReceipt>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Witnesses（私密输入，均不可信，由电路约束验证）
+// Witnesses（私密输入，均不可信，由电路约束验证） / Witnesses (untrusted private inputs validated by circuit constraints)
 // ─────────────────────────────────────────────────────────────────────────────
 
-witness localSecret(): Bytes<32>;     // 当前调用方的 Note 所有者秘密（用户 / 做市商 / 金库）
+witness localSecret(): Bytes<32>;     // 当前调用方的 Note 所有者秘密（用户 / 做市商 / 金库） / Current caller's Note ownership secret (user / maker / treasury)
 witness adminSecret(): Bytes<32>;
 witness adapterSecret(): Bytes<32>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 常量
+// 常量 / Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
 export pure circuit protocolVersion(): Uint<32> {
@@ -189,7 +189,7 @@ export pure circuit bpsDenominator(): Uint<16> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 派生函数
+// 派生函数 / Derivation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 export pure circuit ownerPkOf(secret: Bytes<32>): Bytes<32> {
@@ -212,8 +212,8 @@ export pure circuit swapAssetLeaf(assetId: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "gopay:swap-asset:v1"), assetId]);
 }
 
-// 承诺绑定协议域、合约地址与协议版本，防止跨合约 / 跨版本重放。
-// 以 pure circuit 导出，供钱包在链下计算承诺并查找 Merkle 路径。
+// 承诺绑定协议域、合约地址与协议版本，防止跨合约 / 跨版本重放。 / Commitments bind the protocol domain, contract address and protocol version to prevent cross-contract/version replay.
+// 以 pure circuit 导出，供钱包在链下计算承诺并查找 Merkle 路径。 / Exported as pure circuits so wallets can compute commitments and locate Merkle paths off-chain.
 export pure circuit noteCommitmentFor(contractAddr: Bytes<32>, note: Note): Bytes<32> {
   return persistentCommit<[Bytes<32>, Bytes<32>, Uint<32>, Bytes<32>, Uint<128>, Bytes<32>]>(
     [pad(32, "gopay:note:v1"), contractAddr, protocolVersion(),
@@ -221,8 +221,8 @@ export pure circuit noteCommitmentFor(contractAddr: Bytes<32>, note: Note): Byte
     note.nonce);
 }
 
-// Nullifier 由所有者秘密与 Note 承诺确定性派生，且与承诺使用不同的域。
-// 绑定整个承诺（而非仅随机数），他人复用随机数付款不会使已有 Note 失效。
+// Nullifier 由所有者秘密与 Note 承诺确定性派生，且与承诺使用不同的域。 / Nullifiers are deterministically derived from the owner secret and Note commitment, using a separate domain.
+// 绑定整个承诺（而非仅随机数），他人复用随机数付款不会使已有 Note 失效。 / Binding the full commitment instead of only the nonce prevents nonce reuse by another payer from invalidating an existing Note.
 export pure circuit noteNullifierFor(contractAddr: Bytes<32>,
                                      secret: Bytes<32>,
                                      commitment: Bytes<32>): Bytes<32> {
@@ -236,18 +236,18 @@ export pure circuit orderCommitmentFor(contractAddr: Bytes<32>, order: Order): B
     order.orderNonce);
 }
 
-// 成交与撤单共用同一个订单 nullifier，保证二者互斥。
-// 绑定订单承诺：他人即使知道 orderNonce，也无法构造同一承诺的订单来抢先消费该标记
-// （createOrder 要求 order.ownerPk 与被花费 Note 的所有者一致）。orderNonce 使外部观察者
-// 无法把 nullifier 与订单承诺关联。
+// 成交与撤单共用同一个订单 nullifier，保证二者互斥。 / Filling and cancellation share one order nullifier, making them mutually exclusive.
+// 绑定订单承诺：他人即使知道 orderNonce，也无法构造同一承诺的订单来抢先消费该标记 / Binding the order commitment prevents others from constructing the same committed order and consuming its nullifier first, even if they know orderNonce
+// （createOrder 要求 order.ownerPk 与被花费 Note 的所有者一致）。orderNonce 使外部观察者 / (createOrder requires order.ownerPk to match the spent Note owner). The orderNonce prevents outside observers
+// 无法把 nullifier 与订单承诺关联。 / from linking the nullifier to the order commitment.
 export pure circuit orderNullifierFor(contractAddr: Bytes<32>, order: Order): Bytes<32> {
   return persistentHash<Vector<4, Bytes<32>>>(
     [pad(32, "gopay:order-nf:v1"), contractAddr, orderCommitmentFor(contractAddr, order),
      order.orderNonce]);
 }
 
-// 手续费 Note 的随机数与数量掩码，由 ECDH 共享点和订单 nullifier 派生。
-// 做市商用 S = r·viewKey，金库用 S = tsk·R，得到相同结果。
+// 手续费 Note 的随机数与数量掩码，由 ECDH 共享点和订单 nullifier 派生。 / The fee Note nonce and amount mask are derived from the ECDH shared point and order nullifier.
+// 做市商用 S = r·viewKey，金库用 S = tsk·R，得到相同结果。 / The maker uses S = r·viewKey and the treasury uses S = tsk·R to obtain the same result.
 export pure circuit feeReceiptSecrets(orderNf: Bytes<32>, shared: JubjubPoint): [Bytes<32>, Field] {
   const sx = jubjubPointX(shared);
   const sy = jubjubPointY(shared);
@@ -275,15 +275,15 @@ circuit orderNullifier(order: Order): Bytes<32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 内部约束
+// 内部约束 / Internal constraints
 // ─────────────────────────────────────────────────────────────────────────────
 
 circuit requireAdmin(): [] {
   assert(disclose(adminCommitmentOf(adminSecret()) == adminCommitment), "GoPay: not admin");
 }
 
-// 启停只限制新增铸造；已有赎回请求的完成 / 退款不因停用而被卡住，
-// 被攻破的适配器应通过延迟生效的密钥轮换替换。
+// 启停只限制新增铸造；已有赎回请求的完成 / 退款不因停用而被卡住， / Enable/disable switches restrict new minting only; disabling an adapter does not block completion or refund of existing redemptions.
+// 被攻破的适配器应通过延迟生效的密钥轮换替换。 / Compromised adapter credentials should be replaced through delayed key rotation.
 circuit requireAdapter(adapterId: Bytes<32>, mustBeEnabled: Boolean): AdapterConfig {
   assert(adapters.member(adapterId), "GoPay: unknown adapter");
   const adapter = adapters.lookup(adapterId);
@@ -298,7 +298,7 @@ circuit requireAsset(assetId: Bytes<32>): AssetConfig {
   return assets.lookup(assetId);
 }
 
-// 消费一个 Note：所有权、承诺 / Merkle 路径一致、根有效、nullifier 未使用。
+// 消费一个 Note：所有权、承诺 / Merkle 路径一致、根有效、nullifier 未使用。 / Spend a Note by checking ownership, commitment/path consistency, a valid root and an unused nullifier.
 circuit spendNote(secret: Bytes<32>,
                   note: Note,
                   path: MerkleTreePath<32, Bytes<32>>): Bytes<32> {
@@ -319,7 +319,7 @@ circuit createNote(note: Note): Bytes<32> {
   return cm;
 }
 
-// 验证订单承诺存在且订单标记未被消费，然后消费该标记。
+// 验证订单承诺存在且订单标记未被消费，然后消费该标记。 / Verify that the order commitment exists and its nullifier is unused, then consume that nullifier.
 circuit consumeOrder(order: Order, path: MerkleTreePath<32, Bytes<32>>): Bytes<32> {
   assert(disclose(path.leaf == orderCommitment(order)), "GoPay: order/path mismatch");
   assert(orderCommitments.checkRoot(disclose(merkleTreePathRoot<32, Bytes<32>>(path))),
@@ -330,7 +330,7 @@ circuit consumeOrder(order: Order, path: MerkleTreePath<32, Bytes<32>>): Bytes<3
   return onf;
 }
 
-// 私密资产成员证明：证明资产当前可交易，但不公开是哪一种资产。
+// 私密资产成员证明：证明资产当前可交易，但不公开是哪一种资产。 / Private asset membership proof: prove that the asset is currently tradable without revealing which asset it is.
 circuit requireSwapAsset(assetId: Bytes<32>, path: MerkleTreePath<8, Bytes<32>>): [] {
   assert(disclose(path.leaf == swapAssetLeaf(assetId)), "GoPay: asset/path mismatch");
   assert(swapAssets.checkRoot(disclose(merkleTreePathRoot<8, Bytes<32>>(path))),
@@ -350,7 +350,7 @@ circuit decreaseSupply(assetId: Bytes<32>, amount: Uint<128>): [] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constructor
+// Constructor / 构造函数
 // ─────────────────────────────────────────────────────────────────────────────
 
 constructor(initialAdminCommitment: Bytes<32>,
@@ -370,7 +370,7 @@ constructor(initialAdminCommitment: Bytes<32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Governance：适配器与资产注册
+// Governance：适配器与资产注册 / Governance: adapter and asset registration
 // ─────────────────────────────────────────────────────────────────────────────
 
 export circuit registerAdapter(adapterId: Bytes<32>,
@@ -393,8 +393,8 @@ export circuit setAdapterEnabled(adapterId: Bytes<32>, enabled: Boolean): [] {
   adapters.insert(id, AdapterConfig { ...adapters.lookup(id), enabled: disclose(enabled) });
 }
 
-// 注册后所有操作默认关闭，需经 setAssetOperations 按治理流程启用。
-// 资产身份、表示方式、适配器与储备绑定注册后不可修改；变更须注册新 assetVersion。
+// 注册后所有操作默认关闭，需经 setAssetOperations 按治理流程启用。 / All operations are disabled on registration and must be enabled through governance using setAssetOperations.
+// 资产身份、表示方式、适配器与储备绑定注册后不可修改；变更须注册新 assetVersion。 / Asset identity, representation, adapter and reserve binding are immutable after registration; changes require a new assetVersion.
 export circuit registerAsset(identity: AssetIdentity,
                              representation: Representation,
                              adapterId: Bytes<32>,
@@ -460,14 +460,14 @@ export circuit setAssetOperations(assetId: Bytes<32>,
   });
 }
 
-// 分操作暂停立即生效；撤单与已暂停操作之外的退出路径不受影响。
+// 分操作暂停立即生效；撤单与已暂停操作之外的退出路径不受影响。 / Per-operation pauses take effect immediately; cancellation and exit paths outside the paused operations remain available.
 export circuit setPaused(flags: PauseFlags): [] {
   requireAdmin();
   paused = disclose(flags);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Governance：延迟生效的管理员 / 金库轮换
+// Governance：延迟生效的管理员 / 金库轮换 / Governance: delayed admin / treasury rotation
 // ─────────────────────────────────────────────────────────────────────────────
 
 circuit schedule(update: PendingUpdate): [] {
@@ -502,7 +502,7 @@ export circuit scheduleTreasuryRotation(newOwnerPk: Bytes<32>,
   });
 }
 
-// 替换适配器验证密钥与版本（例如密钥泄露或验证逻辑升级）。
+// 替换适配器验证密钥与版本（例如密钥泄露或验证逻辑升级）。 / Replace the adapter authentication key and version, e.g. after key compromise or a verification logic upgrade.
 export circuit scheduleAdapterRotation(adapterId: Bytes<32>,
                                        newAuthCommitment: Bytes<32>,
                                        newAdapterVersion: Uint<32>,
@@ -524,7 +524,7 @@ export circuit cancelPendingUpdate(): [] {
   pendingUpdate = default<PendingUpdate>;
 }
 
-// 到期后任何人都可应用。金库轮换会提升 treasuryConfigVersion，旧版本订单需重新报价。
+// 到期后任何人都可应用。金库轮换会提升 treasuryConfigVersion，旧版本订单需重新报价。 / Anyone can apply a matured update. Treasury rotation increments treasuryConfigVersion; old-version orders require new quotes.
 export circuit applyPendingUpdate(): [] {
   const update = pendingUpdate;
   assert(update.kind != UpdateKind.none, "GoPay: no pending update");
@@ -548,10 +548,10 @@ export circuit applyPendingUpdate(): [] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vault：unshielded 储备资产存取
+// Vault：unshielded 储备资产存取 / Vault: unshielded reserve deposits and withdrawals
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 存入数量与资产公开（储备变化本身可见），收款 Note 的所有者被承诺隐藏。
+// 存入数量与资产公开（储备变化本身可见），收款 Note 的所有者被承诺隐藏。 / Deposit amount and asset are public because reserve changes are visible; the recipient Note owner is hidden by its commitment.
 export circuit depositUnshielded(assetId: Bytes<32>,
                                  amount: Uint<128>,
                                  recipientPk: Bytes<32>,
@@ -598,7 +598,7 @@ export circuit withdrawUnshielded(assetId: Bytes<32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vault：桥 / 托管适配器入账与赎回
+// Vault：桥 / 托管适配器入账与赎回 / Vault: bridge / custody adapter deposits and redemptions
 // ─────────────────────────────────────────────────────────────────────────────
 
 export circuit adapterMint(assetId: Bytes<32>,
@@ -620,7 +620,7 @@ export circuit adapterMint(assetId: Bytes<32>,
   assert(ev.adapterVersion == adapter.adapterVersion, "GoPay: stale adapter version");
   assert(ev.actualReceivedAmount > 0, "GoPay: zero deposit");
 
-  // 存款 ID 域覆盖来源链，不含资产或适配器，防止同一笔存款铸造多种资产。
+  // 存款 ID 域覆盖来源链，不含资产或适配器，防止同一笔存款铸造多种资产。 / The deposit ID domain includes the source chain but excludes the asset and adapter, preventing one deposit from minting multiple assets.
   const depositKey = persistentHash<Vector<3, Bytes<32>>>(
     [pad(32, "gopay:deposit:v1"), ev.sourceChain, ev.uniqueDepositId]);
   assert(!usedDeposits.member(depositKey), "GoPay: deposit already minted");
@@ -637,7 +637,7 @@ export circuit adapterMint(assetId: Bytes<32>,
   return cm;
 }
 
-// 消费 Note 并创建唯一赎回请求；外链兑付由适配器按异步状态机完成。
+// 消费 Note 并创建唯一赎回请求；外链兑付由适配器按异步状态机完成。 / Spend a Note and create a unique redemption request; the adapter handles external payout through an asynchronous state machine.
 export circuit requestRedemption(assetId: Bytes<32>,
                                  amount: Uint<128>,
                                  destinationCommitment: Bytes<32>,
@@ -692,7 +692,7 @@ export circuit completeRedemption(redemptionId: Bytes<32>, payoutReference: Byte
   });
 }
 
-// 仅在适配器确认外链确定不会兑付时恢复 Note，不采用简单超时退回，避免双重兑付。
+// 仅在适配器确认外链确定不会兑付时恢复 Note，不采用简单超时退回，避免双重兑付。 / Restore the Note only after the adapter confirms the external payout will not occur; avoid timeout-only refunds that could cause double payouts.
 export circuit refundRedemption(redemptionId: Bytes<32>): [] {
   const rid = disclose(redemptionId);
   assert(redemptions.member(rid), "GoPay: unknown redemption");
@@ -705,10 +705,10 @@ export circuit refundRedemption(redemptionId: Bytes<32>): [] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 私密转账
+// 私密转账 / Private transfers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 1 输入 → 收款 + 找零。资产、数量、收款人均不公开。
+// 1 输入 → 收款 + 找零。资产、数量、收款人均不公开。 / One input → recipient output + change. Asset, amount and recipient remain private.
 export circuit transfer(input: Note,
                         inputPath: MerkleTreePath<32, Bytes<32>>,
                         recipientPk: Bytes<32>,
@@ -730,7 +730,7 @@ export circuit transfer(input: Note,
   });
 }
 
-// 2 个同资产 Note 合并为 1 个。
+// 2 个同资产 Note 合并为 1 个。 / Merge two Notes of the same asset into one.
 export circuit merge(first: Note,
                      firstPath: MerkleTreePath<32, Bytes<32>>,
                      second: Note,
@@ -750,10 +750,10 @@ export circuit merge(first: Note,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PrivateSwap：RFQ 整单兑换
+// PrivateSwap：RFQ 整单兑换 / PrivateSwap: full-order RFQ swaps
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 第一步：用户接受报价后，将输入总额锁入隐藏的订单承诺，余额作为找零返回。
+// 第一步：用户接受报价后，将输入总额锁入隐藏的订单承诺，余额作为找零返回。 / Step 1: after accepting a quote, the user locks the total input into a hidden order commitment and receives the remainder as change.
 export circuit createOrder(input: Note,
                            inputPath: MerkleTreePath<32, Bytes<32>>,
                            order: Order,
@@ -765,6 +765,9 @@ export circuit createOrder(input: Note,
   assert(disclose(input.amount >= order.inputAmount), "GoPay: insufficient note amount");
   assert(disclose(order.inputAssetId != order.outputAssetId), "GoPay: same-asset swap");
   assert(disclose(order.inputAmount > 0 && order.netOutputAmount > 0), "GoPay: zero amount");
+  assert(blockTimeLt(disclose(order.expiry)), "GoPay: order expired");
+  assert(disclose(order.treasuryConfigVersion == treasuryConfigVersion),
+         "GoPay: stale treasury config");
   createNote(Note {
     assetId: input.assetId,
     amount: (input.amount - order.inputAmount) as Uint<128>,
@@ -774,10 +777,10 @@ export circuit createOrder(input: Note,
   orderCommitments.insert(orderCommitment(order));
 }
 
-// 第二步：指定做市商原子成交。
-//   输入资产：inputAmount = principal（给做市商）+ fee（给平台金库）
-//   输出资产：makerInput.amount = netOutputAmount（给收款人）+ 做市商找零
-// fee = ceil(inputAmount × 50 / 10000)，由电路校验调用方提供的商值，不信任报价自报。
+// 第二步：指定做市商原子成交。 / Step 2: the designated maker fills the order atomically.
+//   输入资产：inputAmount = principal（给做市商）+ fee（给平台金库） / Input asset: inputAmount = principal (to maker) + fee (to platform treasury)
+//   输出资产：makerInput.amount = netOutputAmount（给收款人）+ 做市商找零 / Output asset: makerInput.amount = netOutputAmount (to recipient) + maker change
+// fee = ceil(inputAmount × 50 / 10000)，由电路校验调用方提供的商值，不信任报价自报。 / fee = ceil(inputAmount × 50 / 10000); the circuit constrains the caller-supplied quotient rather than trusting the quote.
 export circuit fillOrder(order: Order,
                          orderPath: MerkleTreePath<32, Bytes<32>>,
                          makerInput: Note,
@@ -787,23 +790,23 @@ export circuit fillOrder(order: Order,
                          makerReceiveNonce: Bytes<32>,
                          inputAssetPath: MerkleTreePath<8, Bytes<32>>,
                          outputAssetPath: MerkleTreePath<8, Bytes<32>>,
-                         ephemeralKey: JubjubScalar): [] {
+                         ephemeralKey: Field): [] {
   assert(!paused.swap, "GoPay: swaps paused");
   const makerSecret = localSecret();
   const makerPk = ownerPkOf(makerSecret);
 
-  // 订单有效性
+  // 订单有效性 / Order validity
   assert(disclose(order.makerPk == makerPk), "GoPay: not the quoted maker");
   const onf = consumeOrder(order, orderPath);
   assert(blockTimeLt(disclose(order.expiry)), "GoPay: order expired");
   assert(disclose(order.treasuryConfigVersion == treasuryConfigVersion),
          "GoPay: stale treasury config");
 
-  // 两种资产当前均可交易（私密成员证明，不公开币种）
+  // 两种资产当前均可交易（私密成员证明，不公开币种） / Both assets must currently be tradable (private membership proofs hide their identities)
   requireSwapAsset(order.inputAssetId, inputAssetPath);
   requireSwapAsset(order.outputAssetId, outputAssetPath);
 
-  // 固定 50 bps 平台费，向上取整
+  // 固定 50 bps 平台费，向上取整 / Fixed 50 bps platform fee, rounded up
   const scaled = order.inputAmount * feeBps();
   const feeScaled = feeAmount * bpsDenominator();
   assert(disclose(feeScaled >= scaled && feeScaled < scaled + bpsDenominator()),
@@ -811,12 +814,12 @@ export circuit fillOrder(order: Order,
   assert(disclose(order.inputAmount > feeAmount), "GoPay: zero swap principal");
   const principal = (order.inputAmount - feeAmount) as Uint<128>;
 
-  // 做市商库存
+  // 做市商库存 / Maker inventory
   spendNote(makerSecret, makerInput, makerInputPath);
   assert(disclose(makerInput.assetId == order.outputAssetId), "GoPay: maker asset mismatch");
   assert(disclose(makerInput.amount >= order.netOutputAmount), "GoPay: insufficient inventory");
 
-  // 输出：收款人、做市商找零、做市商收到的本金
+  // 输出：收款人、做市商找零、做市商收到的本金 / Outputs: recipient amount, maker change and principal received by the maker
   createNote(Note {
     assetId: order.outputAssetId,
     amount: order.netOutputAmount,
@@ -836,9 +839,9 @@ export circuit fillOrder(order: Order,
     nonce: makerReceiveNonce
   });
 
-  // 平台费 Note + 加密收据（Jubjub ECDH，金库以查看私钥恢复数量与随机数）
+  // 平台费 Note + 加密收据（Jubjub ECDH，金库以查看私钥恢复数量与随机数） / Platform fee Note + encrypted receipt (Jubjub ECDH; the treasury viewing secret recovers the amount and nonce)
   const ephemeralPoint = ecMulGenerator(ephemeralKey);
-  // 拒绝单位元（x = 0），否则收据可被公开解密
+  // 拒绝单位元（x = 0），否则收据可被公开解密 / Reject the identity point (x = 0), which would make the receipt publicly decryptable
   assert(disclose(jubjubPointX(ephemeralPoint) != (0 as Field)), "GoPay: invalid ephemeral key");
   const [feeNonce, mask] = feeReceiptSecrets(onf, ecMul(treasuryViewKey, ephemeralKey));
   const feeCm = createNote(Note {
@@ -854,7 +857,7 @@ export circuit fillOrder(order: Order,
   });
 }
 
-// 用户撤单：与成交共用订单 nullifier，二者只能成功一个。不受暂停影响。
+// 用户撤单：与成交共用订单 nullifier，二者只能成功一个。不受暂停影响。 / User cancellation shares the fill nullifier so only one can succeed; cancellation is unaffected by pauses.
 export circuit cancelOrder(order: Order,
                            orderPath: MerkleTreePath<32, Bytes<32>>,
                            refundNonce: Bytes<32>): [] {
@@ -866,4 +869,219 @@ export circuit cancelOrder(order: Order,
     ownerPk: order.ownerPk,
     nonce: refundNonce
   });
+}
+
+// AMM v1: public reserves, private ownership. Amounts are inferable from reserve deltas. / AMM v1：储备公开、所有权私密；数量可从储备变化推断。
+// LP asset IDs are domain-separated and never registered as depositable assets. / LP 资产 ID 使用独立域，不注册为可存入资产。
+export struct Pool {
+  assetA: Bytes<32>;
+  assetB: Bytes<32>;
+  reserveA: Uint<64>;
+  reserveB: Uint<64>;
+  shares: Uint<64>;
+}
+export ledger pools: Map<Bytes<32>, Pool>;
+
+// Public checkout terms; payer identity is hidden behind a blinded refund key. / 结账条款公开；付款人身份由盲化的退款键隐藏。
+export enum PaymentStatus { open, cancelled, paid, refunded }
+export struct Payment {
+  merchantPk: Bytes<32>;
+  assetId: Bytes<32>;
+  amount: Uint<128>;
+  expiresAt: Uint<64>;
+  status: PaymentStatus;
+  refundCommitment: Bytes<32>;
+  refundedAmount: Uint<128>;
+}
+export ledger payments: Map<Bytes<32>, Payment>;
+
+export pure circuit paymentIdFor(contractAddr: Bytes<32>, merchantPk: Bytes<32>,
+  nonce: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "gopay:payment:v1"), contractAddr, merchantPk, nonce]);
+}
+export pure circuit paymentRefundFor(contractAddr: Bytes<32>, id: Bytes<32>,
+  payerPk: Bytes<32>, nonce: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<4, Bytes<32>>>(
+    [pad(32, "gopay:payment-refund:v1"), contractAddr, id, payerPk], nonce);
+}
+export circuit createPayment(assetId: Bytes<32>, amount: Uint<128>,
+  expiresAt: Uint<64>, nonce: Bytes<32>): Bytes<32> {
+  assert(!paused.transfer, "GoPay: transfers paused");
+  const asset = disclose(assetId);
+  requireAsset(asset);
+  const amt = disclose(amount);
+  assert(amt > 0, "GoPay: zero payment");
+  assert(blockTimeLt(disclose(expiresAt)), "GoPay: payment expired");
+  const merchant = disclose(ownerPkOf(localSecret()));
+  const id = disclose(paymentIdFor(kernel.self().bytes, merchant, nonce));
+  assert(!payments.member(id), "GoPay: payment exists");
+  payments.insert(id, Payment { merchantPk: merchant, assetId: asset, amount: amt,
+    expiresAt: disclose(expiresAt), status: PaymentStatus.open,
+    refundCommitment: default<Bytes<32>>, refundedAmount: 0 });
+  return id;
+}
+export circuit cancelPayment(id: Bytes<32>): [] {
+  const key = disclose(id);
+  assert(payments.member(key), "GoPay: unknown payment");
+  const p = payments.lookup(key);
+  assert(disclose(p.merchantPk == ownerPkOf(localSecret())), "GoPay: not merchant");
+  assert(p.status == PaymentStatus.open, "GoPay: payment not open");
+  payments.insert(key, Payment { ...p, status: PaymentStatus.cancelled });
+}
+export circuit payPayment(id: Bytes<32>, input: Note,
+  path: MerkleTreePath<32, Bytes<32>>, merchantNonce: Bytes<32>,
+  changeNonce: Bytes<32>, refundNonce: Bytes<32>): Bytes<32> {
+  assert(!paused.transfer, "GoPay: transfers paused");
+  const key = disclose(id);
+  assert(payments.member(key), "GoPay: unknown payment");
+  const p = payments.lookup(key);
+  assert(p.status == PaymentStatus.open, "GoPay: payment not open");
+  assert(blockTimeLt(p.expiresAt), "GoPay: payment expired");
+  assert(disclose(input.assetId == p.assetId && input.amount >= p.amount),
+         "GoPay: invalid payment input");
+  spendNote(localSecret(), input, path);
+  const receipt = createNote(Note { assetId: p.assetId, amount: p.amount,
+    ownerPk: p.merchantPk, nonce: merchantNonce });
+  createNote(Note { assetId: p.assetId, amount: (input.amount - p.amount) as Uint<128>,
+    ownerPk: input.ownerPk, nonce: changeNonce });
+  payments.insert(key, Payment { ...p, status: PaymentStatus.paid,
+    refundCommitment: paymentRefundFor(kernel.self().bytes, key, input.ownerPk, refundNonce) });
+  return disclose(receipt);
+}
+// Merchant-funded partial refunds; exits remain available during pauses. / 商户出资的部分退款；暂停期间仍可退出。
+export circuit refundPayment(id: Bytes<32>, input: Note,
+  path: MerkleTreePath<32, Bytes<32>>, amount: Uint<128>, payerPk: Bytes<32>,
+  refundNonce: Bytes<32>, outputNonce: Bytes<32>, changeNonce: Bytes<32>): [] {
+  const key = disclose(id);
+  assert(payments.member(key), "GoPay: unknown payment");
+  const p = payments.lookup(key);
+  assert(p.status == PaymentStatus.paid, "GoPay: payment not refundable");
+  assert(disclose(p.merchantPk == ownerPkOf(localSecret())), "GoPay: not merchant");
+  const amt = disclose(amount);
+  assert(amt > 0 && p.refundedAmount + amt <= p.amount, "GoPay: invalid refund amount");
+  assert(disclose(paymentRefundFor(kernel.self().bytes, key, payerPk, refundNonce)
+                  == p.refundCommitment), "GoPay: wrong refund recipient");
+  assert(disclose(input.assetId == p.assetId && input.amount >= amt),
+         "GoPay: invalid refund input");
+  spendNote(localSecret(), input, path);
+  createNote(Note { assetId: p.assetId, amount: amt, ownerPk: payerPk, nonce: outputNonce });
+  createNote(Note { assetId: p.assetId, amount: (input.amount - amt) as Uint<128>,
+    ownerPk: p.merchantPk, nonce: changeNonce });
+  const total = (p.refundedAmount + amt) as Uint<128>;
+  payments.insert(key, Payment { ...p, refundedAmount: total,
+    status: total == p.amount ? PaymentStatus.refunded : PaymentStatus.paid });
+}
+
+export pure circuit poolIdOf(a: Bytes<32>, b: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "gopay:pool:v1"), a, b]);
+}
+export pure circuit lpAssetOf(id: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "gopay:lp:v1"), id]);
+}
+export circuit createPool(a: Bytes<32>, b: Bytes<32>): [] {
+  assert(!paused.swap, "GoPay: swaps paused");
+  const aa = disclose(a);
+  const bb = disclose(b);
+  assert(aa != bb, "GoPay: same-asset pool");
+  assert(requireAsset(aa).swapEnabled && requireAsset(bb).swapEnabled, "GoPay: asset not tradable");
+  const id = poolIdOf(aa, bb);
+  assert(!pools.member(id) && !pools.member(poolIdOf(bb, aa)), "GoPay: pool exists");
+  pools.insert(id, Pool { assetA: aa, assetB: bb, reserveA: 0, reserveB: 0, shares: 0 });
+}
+circuit ammDeadline(deadline: Uint<64>): [] {
+  assert(blockTimeLte(disclose(deadline)), "GoPay: expired AMM request");
+}
+circuit ammSpend(input: Note, path: MerkleTreePath<32, Bytes<32>>,
+                 asset: Bytes<32>, amount: Uint<64>, nonce: Bytes<32>): [] {
+  assert(disclose(input.assetId == asset && input.amount >= amount), "GoPay: invalid AMM input");
+  spendNote(localSecret(), input, path);
+  createNote(Note { assetId: input.assetId, amount: (input.amount - amount) as Uint<128>,
+                   ownerPk: input.ownerPk, nonce: nonce });
+}
+// Quotients are constrained, never trusted. All products below fit in < 2^143. / 商值由约束验证，不信任调用方；下方所有乘积均小于 2^143。
+circuit ammFloor(q: Uint<64>, numerator: Uint<143>, denominator: Uint<79>): [] {
+  assert(denominator > 0, "GoPay: zero denominator");
+  assert(q * denominator <= numerator && (q + 1) * denominator > numerator,
+         "GoPay: invalid AMM quotient");
+}
+export circuit addLiquidity(id: Bytes<32>,
+  inputA: Note, pathA: MerkleTreePath<32, Bytes<32>>,
+  inputB: Note, pathB: MerkleTreePath<32, Bytes<32>>,
+  amountA: Uint<64>, amountB: Uint<64>, minted: Uint<64>, minShares: Uint<64>,
+  changeA: Bytes<32>, changeB: Bytes<32>, lpNonce: Bytes<32>, deadline: Uint<64>): [] {
+  assert(!paused.swap, "GoPay: swaps paused");
+  ammDeadline(deadline);
+  const key = disclose(id);
+  assert(pools.member(key), "GoPay: unknown pool");
+  const p = pools.lookup(key);
+  assert(requireAsset(p.assetA).swapEnabled && requireAsset(p.assetB).swapEnabled, "GoPay: asset not tradable");
+  const a = disclose(amountA);
+  const b = disclose(amountB);
+  const m = disclose(minted);
+  assert(a > 0 && b > 0 && m > 0 && disclose(m >= minShares), "GoPay: liquidity slippage");
+  if (p.shares == 0) {
+    // floor(sqrt(a*b)), checked without trusting a wallet-computed root. / 首次份额为 floor(sqrt(a*b))，由电路校验，不信任钱包计算的平方根。
+    assert(m * m <= a * b && (m + 1) * (m + 1) > a * b,
+           "GoPay: invalid initial shares");
+  } else {
+    // Exact-ratio deposits avoid silently donating a user's excess assets. / 精确比例存入，避免用户无意中捐赠多余资产。
+    assert(a * p.reserveB == b * p.reserveA, "GoPay: liquidity ratio mismatch");
+    ammFloor(m, a * p.shares, p.reserveA);
+  }
+  ammSpend(inputA, pathA, p.assetA, a, changeA);
+  ammSpend(inputB, pathB, p.assetB, b, changeB);
+  createNote(Note { assetId: lpAssetOf(key), amount: m, ownerPk: ownerPkOf(localSecret()), nonce: lpNonce });
+  pools.insert(key, Pool { assetA: p.assetA, assetB: p.assetB,
+    reserveA: (p.reserveA + a) as Uint<64>, reserveB: (p.reserveB + b) as Uint<64>,
+    shares: (p.shares + m) as Uint<64> });
+}
+export circuit swapExactIn(id: Bytes<32>, aToB: Boolean,
+  input: Note, path: MerkleTreePath<32, Bytes<32>>,
+  amountIn: Uint<64>, amountOut: Uint<64>, minOut: Uint<64>,
+  changeNonce: Bytes<32>, outputNonce: Bytes<32>, deadline: Uint<64>): [] {
+  assert(!paused.swap, "GoPay: swaps paused");
+  ammDeadline(deadline);
+  const key = disclose(id);
+  assert(pools.member(key), "GoPay: unknown pool");
+  const p = pools.lookup(key);
+  assert(requireAsset(p.assetA).swapEnabled && requireAsset(p.assetB).swapEnabled, "GoPay: asset not tradable");
+  const forward = disclose(aToB);
+  const x = forward ? p.reserveA : p.reserveB;
+  const y = forward ? p.reserveB : p.reserveA;
+  const amount = disclose(amountIn);
+  const out = disclose(amountOut);
+  assert(amount > 0 && out > 0 && out < y && disclose(out >= minOut), "GoPay: swap slippage");
+  // 30 bps stay in the pool for LPs; independent of the RFQ platform fee. / 30 bps 留在池中归 LP，独立于 RFQ 平台费。
+  ammFloor(out, amount * 9970 * y, x * 10000 + amount * 9970);
+  ammSpend(input, path, forward ? p.assetA : p.assetB, amount, changeNonce);
+  createNote(Note { assetId: forward ? p.assetB : p.assetA, amount: out,
+    ownerPk: ownerPkOf(localSecret()), nonce: outputNonce });
+  const nextX = (x + amount) as Uint<64>;
+  const nextY = (y - out) as Uint<64>;
+  pools.insert(key, Pool { assetA: p.assetA, assetB: p.assetB,
+    reserveA: forward ? nextX : nextY, reserveB: forward ? nextY : nextX, shares: p.shares });
+}
+// Exit remains available when trading is paused or an asset is disabled. / 暂停交易或停用资产时，仍允许撤出流动性。
+export circuit removeLiquidity(id: Bytes<32>, input: Note, path: MerkleTreePath<32, Bytes<32>>,
+  burned: Uint<64>, amountA: Uint<64>, amountB: Uint<64>, minA: Uint<64>, minB: Uint<64>,
+  changeNonce: Bytes<32>, nonceA: Bytes<32>, nonceB: Bytes<32>, deadline: Uint<64>): [] {
+  ammDeadline(deadline);
+  const key = disclose(id);
+  assert(pools.member(key), "GoPay: unknown pool");
+  const p = pools.lookup(key);
+  const burn = disclose(burned);
+  const a = disclose(amountA);
+  const b = disclose(amountB);
+  assert(burn > 0 && burn <= p.shares, "GoPay: invalid LP burn");
+  assert(a > 0 && b > 0 && disclose(a >= minA && b >= minB), "GoPay: withdrawal slippage");
+  ammFloor(a, burn * p.reserveA, p.shares);
+  ammFloor(b, burn * p.reserveB, p.shares);
+  ammSpend(input, path, lpAssetOf(key), burn, changeNonce);
+  const owner = ownerPkOf(localSecret());
+  createNote(Note { assetId: p.assetA, amount: a, ownerPk: owner, nonce: nonceA });
+  createNote(Note { assetId: p.assetB, amount: b, ownerPk: owner, nonce: nonceB });
+  pools.insert(key, Pool { assetA: p.assetA, assetB: p.assetB,
+    reserveA: (p.reserveA - a) as Uint<64>, reserveB: (p.reserveB - b) as Uint<64>,
+    shares: (p.shares - burn) as Uint<64> });
 }

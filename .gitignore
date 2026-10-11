@@ -3,3 +3,6 @@ src/managed/
 *.log
 .DS_Store
 .env
+.deployment/
+deploy-ui/dist/
+CONTRACT.CN.md

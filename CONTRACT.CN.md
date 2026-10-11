@@ -8,8 +8,8 @@
 
 | 组件 | 版本 |
 |---|---|
-| Compact 编译器 | 0.34.0（语言版本 0.26） |
-| `@midnight-ntwrk/compact-runtime` | 0.19.0 |
+| Compact 编译器 | 0.31.1（语言版本 0.23，ledger 8） |
+| `@midnight-ntwrk/compact-runtime` | 0.16.0 |
 | Node.js | 24.x |
 
 ```bash
@@ -111,7 +111,7 @@ encryptedAmount = fee + mask   （Field 上的一次性掩码）
 
 ## 7. 测试覆盖
 
-[test/gopay.test.ts](test/gopay.test.ts) 共 37 个用例，在本地模拟器（[test/simulator.ts](test/simulator.ts)）中实际执行电路，对应 README 第 11 节：
+[test/gopay.test.ts](test/gopay.test.ts) 原有 37 个用例（新增覆盖见第 8 节），在本地模拟器（[test/simulator.ts](test/simulator.ts)）中实际执行电路，对应 README 第 11 节：
 
 - 注册与治理：资产 ID 派生、同名不同版本分开注册、非管理员被拒、延迟生效的轮换、不覆盖待生效更新
 - Vault：存入额度、开关、双花、越权花费、篡改 Note、零金额转账、复用随机数付款、合并、提现与找零
@@ -119,3 +119,81 @@ encryptedAmount = fee + mask   （Field 上的一次性掩码）
 - 桥接：入账防重放、错误资产/合约/版本/来源链、赎回的完成与退款、停用适配器后仍可处理赎回、适配器密钥轮换、桥接资产无需修改核心即可兑换
 
 模拟器只执行电路逻辑，不生成证明，也不模拟 guaranteed/fallible 分段和真实钱包的交易平衡。README 7.3 要求的失败回滚行为，需要在 devnet 上另行验证。
+
+## 8. Swap / Pool / Position / Payment 补全
+
+### AMM 与 Position
+
+- `createPool(a,b)` 创建公开储备的恒定乘积池，反向币对不能重复创建；所有操作明确检查池存在。
+- `addLiquidity` 首次铸造 `floor(sqrt(amountA × amountB))` 份额；后续存入必须精确匹配储备比例，份额为 `floor(amountA × shares / reserveA)`。不匹配比例直接拒绝，避免用户无意捐赠多余资产。
+- Position 是 `assetId = lpAssetOf(poolId)` 的私密 LP Note。沿用 Note 所有权、转账、合并与 nullifier 防双花；不增加暴露持有者的公开 position 表。钱包需保存 Note 明文与随机数，不能仅从公开池状态还原个人头寸。
+- `swapExactIn` 使用 `floor(amountIn × 9970 × reserveOut / (reserveIn × 10000 + amountIn × 9970))`，30 bps 全部留在池中归 LP；**独立于 RFQ 的 50 bps 平台费**。当前网页费率描述仍对应 RFQ，接入 AMM 前必须按路线显示真实费用。
+- `removeLiquidity` 按份额向下取整返回两种资产；最后一位 LP 可取回全部储备。暂停交易或停用资产仍允许撤出；转账暂停仍限制 LP Note 的普通转账。
+- 加池、兑换、撤出均有 deadline 和最小输出保护。金额、储备和份额上限为 `Uint<64>`，中间乘法使用更宽整数并由电路校验商值；越界拒绝，不截断。
+- [src/amm.ts](src/amm.ts) 提供完全使用 bigint 的报价与 LP 份额计算。调用方必须按**每种资产自己的 decimals** 转成最小单位，不能直接使用网页通用的 8 位显示单位。
+- 当前只支持全范围恒定乘积 Position。网页的自定义价格范围尚不能由此合约结算；集中流动性需要 tick、跨 tick swap 与独立的手续费增长记账，不能把范围输入直接传给本接口。
+
+### Payment
+
+新增 `payments`、`PaymentStatus` 及四个电路：
+
+| 电路 | 行为 |
+|---|---|
+| `createPayment` | 商户证明拥有 merchantPk，创建固定资产、金额、到期时间订单；ID 绑定合约、商户和 nonce，禁止覆盖 |
+| `cancelPayment` | 仅商户取消未付款订单；暂停时仍可取消 |
+| `payPayment` | 到期前以一个同资产 Note 支付精确订单金额，生成商户 Note 与付款人找零，原子标记 paid，禁止重复支付 |
+| `refundPayment` | 仅商户用自己的同资产 Note 退款，支持多次部分退款；累计不超过实付额，全额退完标记 refunded；暂停时仍允许退款 |
+
+状态为 `open → cancelled` 或 `open → paid → refunded`。过期根据 `expiresAt` 派生，不需要 keeper 改写状态，付款要求严格早于到期时间。部分退款保留 paid，以 `refundedAmount` 表示进度。与现有 Payment 服务中的 late/review 等状态并非一一对应：本路径拒绝逾期付款；普通外部转账仍可能迟到，由服务独立处理。
+
+付款人的退款接收键存为 `paymentRefundFor(contract, paymentId, payerPk, refundNonce)` 盲化承诺，不在订单表公开付款人公钥。退款时电路验证承诺，商户不能改成其他收款人。订单 ID、商户公钥、资产、金额、到期时间、状态、累计退款及商户收款 Note 承诺公开，因此此模块不提供隐藏订单金额的承诺。
+
+客户端必须安全保存并私下交付 `merchantNonce`、`payerPk`、`refundNonce`；商户恢复收款 Note 和后续退款依赖这些数据。每个输出 Note 都必须使用新随机数。付款与退款均无额外协议费；退款是商户主动出资操作，并非托管仲裁或强制退款。
+
+### RFQ 与接入边界
+
+`createOrder` 现在立即拒绝已过期订单和失效金库配置，避免先锁钱再在成交时失败；`fillOrder` 保留相同检查，覆盖下单后配置轮换情形。撤单仍可用。
+
+现有 GoPay-Webapp 流动性表单尚未提交链上交易；GoPay-Payment 仍索引 wallet-to-wallet unshielded 转账。此次仅完善合约与钱包计算辅助，**没有切换线上服务、接入钱包或部署合约**。Note 支付与普通钱包转账不能混为同一种结算凭证。新增 ledger 和接口需要新部署及明确迁移，不能直接替换已部署地址上的旧 ABI。
+
+验证包括本地电路执行与完整 ZK 编译。模拟器不验证真实资产输入平衡、网络并发提交、真实证明验证及 guaranteed/fallible 阶段回滚，部署前仍需 devnet 集成验证。
+
+本次验证（2026-10-11）：`npm run compact`、`npm run compact:zk`（29 个电路，58 个非空 prover/verifier 文件）、`npm run typecheck`、`npm test`（3 个测试文件，50 项全部通过）、`git diff --check` 均通过。新增覆盖双向 AMM、比例/初始份额校验、LP 越权和重复销毁、暂停退出、完整清池后重建、支付幂等、取消权限、到期、错误资产、部分/全额退款与错误收款人，以及部署钱包密钥的网络和类型校验。
+
+
+## 9. Preprod / ledger 8 部署（1AM）
+
+公共网络的兼容组合固定为 Compact 0.31.1、runtime 0.16.0、Midnight.js 4.1.1、proof-server 8.1.3。编译脚本显式指定 `+0.31.1`，避免机器默认编译器切回 ledger 9。合约语言声明改为 0.23，ECDH 临时标量使用该版本标准库接受的 `Field`；模拟器适配 ledger 8 的 context API。重新编译后 47 项测试通过。
+
+```bash
+npm ci
+npm run compact:zk
+npm run typecheck
+npm test
+# 本地证明服务独立使用 6301，不影响现有的 6300 服务：
+docker run -d --name gopay-preprod-proof-server-8-1-3 \
+  -p 127.0.0.1:6301:6300 midnightntwrk/proof-server:8.1.3
+npm run check:deploy       # 构建并证明，不平衡、不提交
+npm run typecheck:deploy
+npm run deploy:preprod
+```
+
+打开 `http://127.0.0.1:4318`，使用 **1AM** 连接 Preprod，依次准备部署、核对合约地址、在钱包中授权并提交，然后检查链上状态。部署页复用 Webapp 的全部 11 种语言中央字典；默认英语，保存语言偏好。
+
+工具绑定 loopback，仅允许同源且带临时 CSRF 令牌的写请求。默认从 `../GoPay-Payment/.env` 读取 `PAYMENT_BLOCKFROST_PROJECT_ID`；可通过 `GOPAY_DEPLOY_ENV_FILE` 指向其他本地配置，或设置服务端 `GOPAY_BLOCKFROST_PROJECT_ID`。令牌不会送入浏览器 bundle 或显示在日志中。节点/Indexer 使用 Preprod Blockfrost，证明仅在本机进行。1AM 自身的交易平衡和提交仍使用钱包配置；钱包需要正确的 Preprod 配置与可用 DUST。
+
+第一次启动会在 `.deployment/preprod-secrets.json` 生成独立的管理员、Note 所有者、金库所有者、金库查看及合约维护密钥；文件权限为 0600，目录为 0700，已被 Git 忽略。治理延迟默认 3600 秒。**这些文件不是钱包助记词，但仍是控制合约和金库的秘密，必须安全备份；本地文件没有额外密码加密。** 工具不导出、不读取 1AM 助记词。
+
+待提交交易与地址保存于 `.deployment/preprod-deployment.json`。钱包提交前先记为待确认；提交结果不明确时只检查状态，不自动重新部署。Indexer 检索到地址后，会比对管理员承诺、金库所有者与治理延迟，匹配后才标为 confirmed。没有链上确认之前，预检或 prepared/submitted 状态都不能视为部署成功。确认后还需要注册资产、启用操作并初始化池；此工具不会自动执行这些管理操作。
+
+部署预检：ledger 8 初始合约状态 64,035 字节，已证明但未平衡的交易 64,256 字节。钱包平衡将增加费用相关数据，网络最终接纳情况仍以实际提交和链上确认为准。原先 ledger 9 产物的验证记录仅为历史，不代表可部署到 Preprod。
+
+参考：[官方兼容矩阵](https://docs.midnight.network/relnotes/support-matrix)、[网络端点](https://docs.midnight.network/relnotes/network)。
+
+### 9.1 分批部署验证密钥
+
+29 个电路一次性部署虽然可以编译和生成证明，但 ledger 8 的费用计算会返回 `exceeded block limit in transaction fee computation`。部署工具改为每批最多 5 个验证密钥，共 6 笔交易：第一笔创建合约及 5 个电路，后续通过维护权限安装剩余电路。每笔提交前检查最新链上 ledger 参数的费用限制。
+
+每次授权提交后点击“检查链上状态”；当前批次确认后，点击“准备部署”生成下一批，再授权提交。进度见原始 JSON 的 `installedCircuits` / `totalCircuits`。只有全部 29 个验证密钥与本地编译产物一致，且管理员、金库、治理延迟匹配时，才标记为完成；部署途中不要对外启用合约。
+
+旧的一次性部署仅在本地状态为 prepared 且链上查不到旧地址时迁移；原记录备份为 `.deployment/preprod-deployment-before-phased.json`，管理员及金库秘密不变，合约地址重新生成。已提交的记录不会自动替换。`npm run check:deploy` 在本地生成并验证全部 6 笔交易的费用，不进行提交。

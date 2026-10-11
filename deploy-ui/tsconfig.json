@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "lib": ["ES2022", "DOM"], "module": "ESNext",
+    "moduleResolution": "Bundler", "strict": true, "skipLibCheck": true,
+    "jsx": "react-jsx", "resolveJsonModule": true, "esModuleInterop": true,
+    "noEmit": true,
+    "typeRoots": ["../node_modules/@types", "../../GoPay-Webapp/node_modules/@types"]
+  },
+  "include": ["*.tsx", "*.ts"]
+}

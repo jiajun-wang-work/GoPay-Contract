@@ -72,12 +72,10 @@ export class GoPaySimulator {
     ...args: CircuitArgs<K>
   ): Promise<CircuitReturn<K>> {
     const ctx = createCircuitContext(
-      name,
       this.address,
       COIN_PUBLIC_KEY,
       this.state,
       caller,
-      undefined,
       undefined,
       undefined,
       this.time,
@@ -87,7 +85,7 @@ export class GoPaySimulator {
       ...a: CircuitArgs<K>
     ) => Promise<{ result: CircuitReturn<K>; context: typeof ctx }>;
     const { result, context } = await circuit(ctx, ...args);
-    this.state = context.callContext.currentQueryContext.state;
+    this.state = context.currentQueryContext.state;
     return result;
   }
 
