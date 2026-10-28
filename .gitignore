@@ -4,5 +4,7 @@ src/managed/
 .DS_Store
 .env
 .deployment/
+.deployment-*/
 deploy-ui/dist/
 CONTRACT.CN.md
+GoPay-Contract.sh

@@ -182,9 +182,9 @@ npm run deploy:preprod
 
 工具绑定 loopback，仅允许同源且带临时 CSRF 令牌的写请求。默认从 `../GoPay-Payment/.env` 读取 `PAYMENT_BLOCKFROST_PROJECT_ID`；可通过 `GOPAY_DEPLOY_ENV_FILE` 指向其他本地配置，或设置服务端 `GOPAY_BLOCKFROST_PROJECT_ID`。令牌不会送入浏览器 bundle 或显示在日志中。节点/Indexer 使用 Preprod Blockfrost，证明仅在本机进行。1AM 自身的交易平衡和提交仍使用钱包配置；钱包需要正确的 Preprod 配置与可用 DUST。
 
-第一次启动会在 `.deployment/preprod-secrets.json` 生成独立的管理员、Note 所有者、金库所有者、金库查看及合约维护密钥；文件权限为 0600，目录为 0700，已被 Git 忽略。治理延迟默认 3600 秒。**这些文件不是钱包助记词，但仍是控制合约和金库的秘密，必须安全备份；本地文件没有额外密码加密。** 工具不导出、不读取 1AM 助记词。
+第一次启动会在 `.deployment-preprod/preprod-secrets.json` 生成独立的管理员、Note 所有者、金库所有者、金库查看及合约维护密钥；文件权限为 0600，目录为 0700，已被 Git 忽略。治理延迟默认 3600 秒。**这些文件不是钱包助记词，但仍是控制合约和金库的秘密，必须安全备份；本地文件没有额外密码加密。** 工具不导出、不读取 1AM 助记词。
 
-待提交交易与地址保存于 `.deployment/preprod-deployment.json`。钱包提交前先记为待确认；提交结果不明确时只检查状态，不自动重新部署。Indexer 检索到地址后，会比对管理员承诺、金库所有者与治理延迟，匹配后才标为 confirmed。没有链上确认之前，预检或 prepared/submitted 状态都不能视为部署成功。确认后还需要注册资产、启用操作并初始化池；此工具不会自动执行这些管理操作。
+待提交交易与地址保存于 `.deployment-preprod/preprod-deployment.json`。钱包提交前先记为待确认；提交结果不明确时只检查状态，不自动重新部署。Indexer 检索到地址后，会比对管理员承诺、金库所有者与治理延迟，匹配后才标为 confirmed。没有链上确认之前，预检或 prepared/submitted 状态都不能视为部署成功。确认后还需要注册资产、启用操作并初始化池；此工具不会自动执行这些管理操作。
 
 部署预检：ledger 8 初始合约状态 64,035 字节，已证明但未平衡的交易 64,256 字节。钱包平衡将增加费用相关数据，网络最终接纳情况仍以实际提交和链上确认为准。原先 ledger 9 产物的验证记录仅为历史，不代表可部署到 Preprod。
 
@@ -196,4 +196,25 @@ npm run deploy:preprod
 
 每次授权提交后点击“检查链上状态”；当前批次确认后，点击“准备部署”生成下一批，再授权提交。进度见原始 JSON 的 `installedCircuits` / `totalCircuits`。只有全部 29 个验证密钥与本地编译产物一致，且管理员、金库、治理延迟匹配时，才标记为完成；部署途中不要对外启用合约。
 
-旧的一次性部署仅在本地状态为 prepared 且链上查不到旧地址时迁移；原记录备份为 `.deployment/preprod-deployment-before-phased.json`，管理员及金库秘密不变，合约地址重新生成。已提交的记录不会自动替换。`npm run check:deploy` 在本地生成并验证全部 6 笔交易的费用，不进行提交。
+旧的一次性部署仅在本地状态为 prepared 且链上查不到旧地址时迁移；原记录备份为 `.deployment-preprod/preprod-deployment-before-phased.json`，管理员及金库秘密不变，合约地址重新生成。已提交的记录不会自动替换。`npm run check:deploy` 在本地生成并验证全部 6 笔交易的费用，不进行提交。
+
+### 9.2 多网络部署目录与 Preview
+
+Preview 与 Preprod 的兼容组合相同（ledger 8、Compact 0.31.1、runtime 0.16.0、Midnight.js 4.1.1、proof-server 8.1.3），同一份编译产物可直接部署，合约源码与 `src/managed/gopay` 共用。**不要使用 Compact 0.34/0.35 重新编译**：它们面向 ledger 9，无法部署到任一公共网络。
+
+| 内容 | 位置 | 说明 |
+|---|---|---|
+| 合约、编译产物、测试 | `src/`、`test/` | 各网络共用 |
+| 部署工具 | `scripts/deploy-server.mjs <network>`、`scripts/check-deploy.mjs <network>` | 共用；网络端点、端口见 `scripts/networks.mjs` |
+| 部署页 | `deploy-ui/` | 共用；网络由服务端 `/config` 提供，页面在内存中打包 |
+| 部署记录与秘密 | `.deployment-preprod/`、`.deployment-preview/` | 按网络隔离，均被 Git 忽略；各网络使用独立的管理员、金库与维护密钥 |
+
+```bash
+npm run check:deploy:preview   # 构建并证明，不平衡、不提交
+npm run deploy:preview         # http://127.0.0.1:4319
+npm run deploy:preprod         # http://127.0.0.1:4318
+```
+
+Preview 使用 Midnight 托管的公共 Indexer（`https://indexer.preview.midnight.network/api/v4/graphql`），无需 Blockfrost 令牌。两个网络可以同时运行，共用本机 6301 证明服务。1AM 需切换到 Preview，并持有来自 Preview 水龙头的 tNIGHT 及其生成的 DUST。首次运行在 `.deployment-preview/preview-secrets.json` 生成新秘密，备份要求与 Preprod 相同。部署记录写入时带网络标识，服务启动时拒绝加载其他网络的记录。
+
+Preview 部署确认后，Webapp 需设置 `NEXT_PUBLIC_MIDNIGHT_NETWORK=preview`、新的 `NEXT_PUBLIC_GOPAY_CONTRACT_ADDRESS`，以及 `GOPAY_INDEXER_URL` 指向上述 Preview Indexer；注册资产时 `sourceChain` 默认填为 `midnight-preview`。

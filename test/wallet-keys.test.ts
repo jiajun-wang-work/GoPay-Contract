@@ -18,6 +18,12 @@ describe('Gero connector public keys', () => {
     const correct = encode('preprod');
     expect(() => normalizeWalletKeys(correct.encryption, correct.coin)).toThrow('INVALID_WALLET_KEY');
   });
+  it('decodes Preview keys only when Preview is selected', () => {
+    const keys = encode('preview');
+    expect(normalizeWalletKeys(keys.coin, keys.encryption, 'preview')).toEqual({ coinPublicKey: coin, encryptionPublicKey: encryption });
+    const preprod = encode('preprod');
+    expect(() => normalizeWalletKeys(preprod.coin, preprod.encryption, 'preview')).toThrow('INVALID_WALLET_KEY');
+  });
   it('accepts legacy hex and rejects malformed keys', () => {
     expect(normalizeWalletKeys(coin, encryption)).toEqual({ coinPublicKey: coin, encryptionPublicKey: encryption });
     expect(() => normalizeWalletKeys('invalid', encryption)).toThrow('INVALID_WALLET_KEY');
